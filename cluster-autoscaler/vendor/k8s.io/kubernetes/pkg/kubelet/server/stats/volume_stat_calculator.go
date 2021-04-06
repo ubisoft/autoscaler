@@ -24,8 +24,8 @@ import (
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util"
 
 	"k8s.io/klog/v2"
 )
@@ -109,7 +109,7 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 		if err != nil {
 			// Expected for Volumes that don't support Metrics
 			if !volume.IsNotSupported(err) {
-				klog.V(4).Infof("Failed to calculate volume metrics for pod %s volume %s: %+v", format.Pod(s.pod), name, err)
+				klog.V(4).InfoS("Failed to calculate volume metrics", "pod", klog.KObj(s.pod), "podUID", s.pod.UID, "volumeName", name, "err", err)
 			}
 			continue
 		}
@@ -123,7 +123,7 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 			}
 		}
 		volumeStats := s.parsePodVolumeStats(name, pvcRef, metric, volSpec)
-		if isVolumeEphemeral(volSpec) {
+		if util.IsLocalEphemeralVolume(volSpec) {
 			ephemeralStats = append(ephemeralStats, volumeStats)
 		} else {
 			persistentStats = append(persistentStats, volumeStats)
@@ -165,12 +165,4 @@ func (s *volumeStatCalculator) parsePodVolumeStats(podName string, pvcRef *stats
 		FsStats: stats.FsStats{Time: metric.Time, AvailableBytes: &available, CapacityBytes: &capacity,
 			UsedBytes: &used, Inodes: &inodes, InodesFree: &inodesFree, InodesUsed: &inodesUsed},
 	}
-}
-
-func isVolumeEphemeral(volume v1.Volume) bool {
-	if (volume.EmptyDir != nil && volume.EmptyDir.Medium == v1.StorageMediumDefault) ||
-		volume.ConfigMap != nil || volume.GitRepo != nil {
-		return true
-	}
-	return false
 }

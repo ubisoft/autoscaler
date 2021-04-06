@@ -233,6 +233,7 @@ func NewLegacyRegistry() *LegacyRegistry {
 			plugins.Filter = appendToPluginSet(plugins.Filter, nodeports.Name, nil)
 			plugins.PreFilter = appendToPluginSet(plugins.PreFilter, nodeports.Name, nil)
 			plugins.Filter = appendToPluginSet(plugins.Filter, nodeaffinity.Name, nil)
+			plugins.PreFilter = appendToPluginSet(plugins.PreFilter, nodeaffinity.Name, nil)
 		})
 	registry.registerPredicateConfigProducer(PodToleratesNodeTaintsPred,
 		func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
@@ -259,6 +260,7 @@ func NewLegacyRegistry() *LegacyRegistry {
 	registry.registerPredicateConfigProducer(MatchNodeSelectorPred,
 		func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
 			plugins.Filter = appendToPluginSet(plugins.Filter, nodeaffinity.Name, nil)
+			plugins.PreFilter = appendToPluginSet(plugins.PreFilter, nodeaffinity.Name, nil)
 		})
 	registry.registerPredicateConfigProducer(CheckNodeUnschedulablePred,
 		func(_ ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
@@ -360,6 +362,7 @@ func NewLegacyRegistry() *LegacyRegistry {
 		})
 	registry.registerPriorityConfigProducer(NodeAffinityPriority,
 		func(args ConfigProducerArgs, plugins *config.Plugins, _ *[]config.PluginConfig) {
+			plugins.PreScore = appendToPluginSet(plugins.PreScore, nodeaffinity.Name, nil)
 			plugins.Score = appendToPluginSet(plugins.Score, nodeaffinity.Name, &args.Weight)
 		})
 	registry.registerPriorityConfigProducer(ImageLocalityPriority,
@@ -523,10 +526,7 @@ func (lr *LegacyRegistry) registerPriorityConfigProducer(name string, producer c
 	lr.priorityToConfigProducer[name] = producer
 }
 
-func appendToPluginSet(set *config.PluginSet, name string, weight *int32) *config.PluginSet {
-	if set == nil {
-		set = &config.PluginSet{}
-	}
+func appendToPluginSet(set config.PluginSet, name string, weight *int32) config.PluginSet {
 	for _, e := range set.Enabled {
 		if e.Name == name {
 			// Keep the max weight.

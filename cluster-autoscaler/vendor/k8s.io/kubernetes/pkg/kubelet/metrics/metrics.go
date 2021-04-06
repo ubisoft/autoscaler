@@ -53,6 +53,8 @@ const (
 	VolumeStatsInodesKey         = "volume_stats_inodes"
 	VolumeStatsInodesFreeKey     = "volume_stats_inodes_free"
 	VolumeStatsInodesUsedKey     = "volume_stats_inodes_used"
+	RunningPodsKey               = "running_pods"
+	RunningContainersKey         = "running_containers"
 	// Metrics keys of remote runtime operations
 	RuntimeOperationsKey         = "runtime_operations_total"
 	RuntimeOperationsDurationKey = "runtime_operations_duration_seconds"
@@ -90,13 +92,13 @@ var (
 		},
 		[]string{NodeLabelKey},
 	)
-	// ContainersPerPodCount is a Counter that tracks the number of containers per pod.
+	// ContainersPerPodCount is a Histogram that tracks the number of containers per pod.
 	ContainersPerPodCount = metrics.NewHistogram(
 		&metrics.HistogramOpts{
 			Subsystem:      KubeletSubsystem,
 			Name:           "containers_per_pod_count",
 			Help:           "The number of containers per pod.",
-			Buckets:        metrics.DefBuckets,
+			Buckets:        metrics.ExponentialBuckets(1, 2, 5),
 			StabilityLevel: metrics.ALPHA,
 		},
 	)
@@ -362,7 +364,7 @@ var (
 	RunningPodCount = metrics.NewGauge(
 		&metrics.GaugeOpts{
 			Subsystem:      KubeletSubsystem,
-			Name:           "running_pods",
+			Name:           RunningPodsKey,
 			Help:           "Number of pods currently running",
 			StabilityLevel: metrics.ALPHA,
 		},
@@ -371,7 +373,7 @@ var (
 	RunningContainerCount = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
 			Subsystem:      KubeletSubsystem,
-			Name:           "running_containers",
+			Name:           RunningContainersKey,
 			Help:           "Number of containers currently running",
 			StabilityLevel: metrics.ALPHA,
 		},
@@ -465,7 +467,7 @@ func SetAssignedConfig(source *corev1.NodeConfigSource) error {
 	}
 	// clean up the old timeseries (WithLabelValues creates a new one for each distinct label set)
 	if !AssignedConfig.Delete(assignedConfigLabels) {
-		klog.Warningf("Failed to delete metric for labels %v. This may result in ambiguity from multiple metrics concurrently indicating different assigned configs.", assignedConfigLabels)
+		klog.InfoS("Failed to delete metric for labels. This may result in ambiguity from multiple metrics concurrently indicating different assigned configs.", "labels", assignedConfigLabels)
 	}
 	// record the new timeseries
 	assignedConfigLabels = labels
@@ -487,7 +489,7 @@ func SetActiveConfig(source *corev1.NodeConfigSource) error {
 	}
 	// clean up the old timeseries (WithLabelValues creates a new one for each distinct label set)
 	if !ActiveConfig.Delete(activeConfigLabels) {
-		klog.Warningf("Failed to delete metric for labels %v. This may result in ambiguity from multiple metrics concurrently indicating different active configs.", activeConfigLabels)
+		klog.InfoS("Failed to delete metric for labels. This may result in ambiguity from multiple metrics concurrently indicating different active configs.", "labels", activeConfigLabels)
 	}
 	// record the new timeseries
 	activeConfigLabels = labels
@@ -509,7 +511,7 @@ func SetLastKnownGoodConfig(source *corev1.NodeConfigSource) error {
 	}
 	// clean up the old timeseries (WithLabelValues creates a new one for each distinct label set)
 	if !LastKnownGoodConfig.Delete(lastKnownGoodConfigLabels) {
-		klog.Warningf("Failed to delete metric for labels %v. This may result in ambiguity from multiple metrics concurrently indicating different last known good configs.", lastKnownGoodConfigLabels)
+		klog.InfoS("Failed to delete metric for labels. This may result in ambiguity from multiple metrics concurrently indicating different last known good configs.", "labels", lastKnownGoodConfigLabels)
 	}
 	// record the new timeseries
 	lastKnownGoodConfigLabels = labels
