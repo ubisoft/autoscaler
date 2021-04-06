@@ -16,11 +16,13 @@ var loggerTransport = &transport{
 	Transport: http.DefaultTransport,
 }
 
+// DefaultLogRequest is used if transport.LogRequest is not set.
 var DefaultLogRequest = func(req *http.Request) {
 	a, _ := httputil.DumpRequestOut(req, true)
 	log.Printf("-->\n%s", a)
 }
 
+// DefaultLogResponse is used if transport.LogResponse is not set.
 var DefaultLogResponse = func(resp *http.Response) {
 	a, _ := httputil.DumpResponse(resp, true)
 	log.Printf("<--\n%s", a)

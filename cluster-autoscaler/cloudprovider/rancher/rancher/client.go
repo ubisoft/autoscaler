@@ -9,11 +9,13 @@ import (
 	"os"
 )
 
+// Cluster represents a Rancher cluster.
 type Cluster struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
+// NodePool represents a Rancher nodePool.
 type NodePool struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
@@ -29,6 +31,7 @@ type nodePoolResponse struct {
 	Data []NodePool `json:"data"`
 }
 
+// Node represents a Rancher node.
 type Node struct {
 	ID         string `json:"id"`
 	Name       string `json:"nodeName"`
@@ -42,6 +45,7 @@ type nodeResponse struct {
 	Data []Node `json:"data"`
 }
 
+// Client is an HTTP client for RancherAPI.
 type Client struct {
 	url   string
 	token string
