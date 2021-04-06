@@ -110,7 +110,7 @@ func TestNodePoolsByCluster(t *testing.T) {
 }
 
 func TestNodePoolByID(t *testing.T) {
-	t.Run("sucess", func(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			response := `
 			{
