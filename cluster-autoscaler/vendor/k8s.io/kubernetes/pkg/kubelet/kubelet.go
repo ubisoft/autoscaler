@@ -124,6 +124,9 @@ const (
 	// Max amount of time to wait for the container runtime to come up.
 	maxWaitForContainerRuntime = 30 * time.Second
 
+	// Max amount of time to wait for node list/watch to initially sync
+	maxWaitForAPIServerSync = 10 * time.Second
+
 	// nodeStatusUpdateRetry specifies how many times kubelet retries when posting node status failed.
 	nodeStatusUpdateRetry = 5
 
@@ -141,7 +144,8 @@ const (
 	evictionMonitoringPeriod = time.Second * 10
 
 	// The path in containers' filesystems where the hosts file is mounted.
-	etcHostsPath = "/etc/hosts"
+	linuxEtcHostsPath   = "/etc/hosts"
+	windowsEtcHostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts"
 
 	// Capacity of the channel for receiving pod lifecycle events. This number
 	// is a bit arbitrary and may be adjusted in the future.
@@ -174,6 +178,15 @@ const (
 	nodeLeaseRenewIntervalFraction = 0.25
 )
 
+var etcHostsPath = getContainerEtcHostsPath()
+
+func getContainerEtcHostsPath() string {
+	if sysruntime.GOOS == "windows" {
+		return windowsEtcHostsPath
+	}
+	return linuxEtcHostsPath
+}
+
 // SyncHandler is an interface implemented by Kubelet, for testability
 type SyncHandler interface {
 	HandlePodAdditions(pods []*v1.Pod)
@@ -192,8 +205,8 @@ type Bootstrap interface {
 	GetConfiguration() kubeletconfiginternal.KubeletConfiguration
 	BirthCry()
 	StartGarbageCollection()
-	ListenAndServe(address net.IP, port uint, tlsOptions *server.TLSOptions, auth server.AuthInterface, enableCAdvisorJSONEndpoints, enableDebuggingHandlers, enableContentionProfiling, enableSystemLogHandler bool)
-	ListenAndServeReadOnly(address net.IP, port uint, enableCAdvisorJSONEndpoints bool)
+	ListenAndServe(kubeCfg *kubeletconfiginternal.KubeletConfiguration, tlsOptions *server.TLSOptions, auth server.AuthInterface)
+	ListenAndServeReadOnly(address net.IP, port uint)
 	ListenAndServePodResources()
 	Run(<-chan kubetypes.PodUpdate)
 	RunOnce(<-chan kubetypes.PodUpdate) ([]RunPodResult, error)
@@ -420,6 +433,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 
 	var serviceLister corelisters.ServiceLister
 	var serviceHasSynced cache.InformerSynced
+	// If kubeClient == nil, we are running in standalone mode (i.e. no API servers)
+	// If not nil, we are running as part of a cluster and should sync w/API
 	if kubeDeps.KubeClient != nil {
 		kubeInformers := informers.NewSharedInformerFactory(kubeDeps.KubeClient, 0)
 		serviceLister = kubeInformers.Core().V1().Services().Lister()
@@ -431,14 +446,30 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		serviceHasSynced = func() bool { return true }
 	}
 
-	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	var nodeHasSynced cache.InformerSynced
+	var nodeLister corelisters.NodeLister
+
 	if kubeDeps.KubeClient != nil {
-		fieldSelector := fields.Set{api.ObjectNameField: string(nodeName)}.AsSelector()
-		nodeLW := cache.NewListWatchFromClient(kubeDeps.KubeClient.CoreV1().RESTClient(), "nodes", metav1.NamespaceAll, fieldSelector)
-		r := cache.NewReflector(nodeLW, &v1.Node{}, nodeIndexer, 0)
-		go r.Run(wait.NeverStop)
+		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.Set{metav1.ObjectNameField: string(nodeName)}.String()
+		}))
+		nodeLister = kubeInformers.Core().V1().Nodes().Lister()
+		nodeHasSynced = func() bool {
+			if kubeInformers.Core().V1().Nodes().Informer().HasSynced() {
+				return true
+			}
+			klog.Infof("kubelet nodes not sync")
+			return false
+		}
+		kubeInformers.Start(wait.NeverStop)
+		klog.Info("Kubelet client is not nil")
+	} else {
+		// we dont have a client to sync!
+		nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		nodeLister = corelisters.NewNodeLister(nodeIndexer)
+		nodeHasSynced = func() bool { return true }
+		klog.Info("Kubelet client is nil")
 	}
-	nodeLister := corelisters.NewNodeLister(nodeIndexer)
 
 	// construct a node reference used for events
 	nodeRef := &v1.ObjectReference{
@@ -481,6 +512,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		serviceLister:                           serviceLister,
 		serviceHasSynced:                        serviceHasSynced,
 		nodeLister:                              nodeLister,
+		nodeHasSynced:                           nodeHasSynced,
 		masterServiceNamespace:                  masterServiceNamespace,
 		streamingConnectionIdleTimeout:          kubeCfg.StreamingConnectionIdleTimeout.Duration,
 		recorder:                                kubeDeps.Recorder,
@@ -526,8 +558,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	var configMapManager configmap.Manager
 	switch kubeCfg.ConfigMapAndSecretChangeDetectionStrategy {
 	case kubeletconfiginternal.WatchChangeDetectionStrategy:
-		secretManager = secret.NewWatchingSecretManager(kubeDeps.KubeClient)
-		configMapManager = configmap.NewWatchingConfigMapManager(kubeDeps.KubeClient)
+		secretManager = secret.NewWatchingSecretManager(kubeDeps.KubeClient, klet.resyncInterval)
+		configMapManager = configmap.NewWatchingConfigMapManager(kubeDeps.KubeClient, klet.resyncInterval)
 	case kubeletconfiginternal.TTLCacheChangeDetectionStrategy:
 		secretManager = secret.NewCachingSecretManager(
 			kubeDeps.KubeClient, manager.GetObjectTTLFromNodeFunc(klet.GetNode))
@@ -544,18 +576,22 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.configMapManager = configMapManager
 
 	if klet.experimentalHostUserNamespaceDefaulting {
-		klog.Infof("Experimental host user namespace defaulting is enabled.")
+		klog.Info("Experimental host user namespace defaulting is enabled.")
 	}
 
 	machineInfo, err := klet.cadvisor.MachineInfo()
 	if err != nil {
 		return nil, err
 	}
+	// Avoid collector collects it as a timestamped metric
+	// See PR #95210 and #97006 for more details.
+	machineInfo.Timestamp = time.Time{}
 	klet.setCachedMachineInfo(machineInfo)
 
 	imageBackOff := flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
 
 	klet.livenessManager = proberesults.NewManager()
+	klet.readinessManager = proberesults.NewManager()
 	klet.startupManager = proberesults.NewManager()
 	klet.podCache = kubecontainer.NewCache()
 
@@ -574,7 +610,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		klet.runtimeClassManager = runtimeclass.NewManager(kubeDeps.KubeClient)
 	}
 
-	if containerRuntime == kubetypes.RemoteContainerRuntime && utilfeature.DefaultFeatureGate.Enabled(features.CRIContainerLogRotation) {
+	if containerRuntime == kubetypes.RemoteContainerRuntime {
 		// setup containerLogManager for CRI container runtime
 		containerLogManager, err := logs.NewContainerLogManager(
 			klet.runtimeService,
@@ -593,6 +629,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	runtime, err := kuberuntime.NewKubeGenericRuntimeManager(
 		kubecontainer.FilterEventRecorder(kubeDeps.Recorder),
 		klet.livenessManager,
+		klet.readinessManager,
 		klet.startupManager,
 		seccompProfileRoot,
 		machineInfo,
@@ -628,6 +665,10 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	}
 	klet.runtimeCache = runtimeCache
 
+	// common provider to get host file system usage associated with a pod managed by kubelet
+	hostStatsProvider := stats.NewHostStatsProvider(kubecontainer.RealOS{}, func(podUID types.UID) string {
+		return getEtcHostsPath(klet.getPodDir(podUID))
+	})
 	if kubeDeps.useLegacyCadvisorStats {
 		klet.StatsProvider = stats.NewCadvisorStatsProvider(
 			klet.cadvisor,
@@ -635,7 +676,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 			klet.podManager,
 			klet.runtimeCache,
 			klet.containerRuntime,
-			klet.statusManager)
+			klet.statusManager,
+			hostStatsProvider)
 	} else {
 		klet.StatsProvider = stats.NewCRIStatsProvider(
 			klet.cadvisor,
@@ -644,8 +686,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 			klet.runtimeCache,
 			kubeDeps.RemoteRuntimeService,
 			kubeDeps.RemoteImageService,
-			stats.NewLogMetricsService(),
-			kubecontainer.RealOS{})
+			hostStatsProvider)
 	}
 
 	klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, plegChannelCapacity, plegRelistPeriod, klet.podCache, clock.RealClock{})
@@ -662,7 +703,6 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	}
 	klet.containerGC = containerGC
 	klet.containerDeletor = newPodContainerDeletor(klet.containerRuntime, integer.IntMax(containerGCPolicy.MaxPerPodContainer, minDeadContainerInPod))
-	klet.sandboxDeleter = newPodSandboxDeleter(klet.containerRuntime)
 
 	// setup imageManager
 	imageManager, err := images.NewImageGCManager(klet.containerRuntime, klet.StatsProvider, kubeDeps.Recorder, nodeRef, imageGCPolicy, crOptions.PodSandboxImage)
@@ -688,6 +728,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.probeManager = prober.NewManager(
 		klet.statusManager,
 		klet.livenessManager,
+		klet.readinessManager,
 		klet.startupManager,
 		klet.runner,
 		kubeDeps.Recorder)
@@ -740,23 +781,20 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.backOff = flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
 	klet.podKiller = NewPodKiller(klet)
 
-	etcHostsPathFunc := func(podUID types.UID) string { return getEtcHostsPath(klet.getPodDir(podUID)) }
 	// setup eviction manager
-	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock, etcHostsPathFunc)
+	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock)
 
 	klet.evictionManager = evictionManager
 	klet.admitHandlers.AddPodAdmitHandler(evictionAdmitHandler)
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.Sysctls) {
-		// Safe, whitelisted sysctls can always be used as unsafe sysctls in the spec.
-		// Hence, we concatenate those two lists.
-		safeAndUnsafeSysctls := append(sysctlwhitelist.SafeSysctlWhitelist(), allowedUnsafeSysctls...)
-		sysctlsWhitelist, err := sysctl.NewWhitelist(safeAndUnsafeSysctls)
-		if err != nil {
-			return nil, err
-		}
-		klet.admitHandlers.AddPodAdmitHandler(sysctlsWhitelist)
+	// Safe, whitelisted sysctls can always be used as unsafe sysctls in the spec.
+	// Hence, we concatenate those two lists.
+	safeAndUnsafeSysctls := append(sysctlwhitelist.SafeSysctlWhitelist(), allowedUnsafeSysctls...)
+	sysctlsWhitelist, err := sysctl.NewWhitelist(safeAndUnsafeSysctls)
+	if err != nil {
+		return nil, err
 	}
+	klet.admitHandlers.AddPodAdmitHandler(sysctlsWhitelist)
 
 	// enable active deadline handler
 	activeDeadlineHandler, err := newActiveDeadlineHandler(klet.statusManager, kubeDeps.Recorder, klet.clock)
@@ -795,7 +833,11 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		v1.NamespaceNodeLease,
 		util.SetNodeOwnerFunc(klet.heartbeatClient, string(klet.nodeName)))
 
-	klet.shutdownManager = nodeshutdown.NewManager(klet.GetActivePods, killPodNow(klet.podWorkers, kubeDeps.Recorder), kubeCfg.ShutdownGracePeriod.Duration, kubeCfg.ShutdownGracePeriodCriticalPods.Duration)
+	// setup node shutdown manager
+	shutdownManager, shutdownAdmitHandler := nodeshutdown.NewManager(klet.GetActivePods, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.syncNodeStatus, kubeCfg.ShutdownGracePeriod.Duration, kubeCfg.ShutdownGracePeriodCriticalPods.Duration)
+
+	klet.shutdownManager = shutdownManager
+	klet.admitHandlers.AddPodAdmitHandler(shutdownAdmitHandler)
 
 	// Finally, put the most recent version of the config on the Kubelet, so
 	// people can see how it was configured.
@@ -879,7 +921,9 @@ type Kubelet struct {
 	serviceHasSynced cache.InformerSynced
 	// nodeLister knows how to list nodes
 	nodeLister corelisters.NodeLister
-
+	// nodeHasSynced indicates whether nodes have been sync'd at least once.
+	// Check this before trusting a response from the node lister.
+	nodeHasSynced cache.InformerSynced
 	// a list of node labels to register
 	nodeLabels map[string]string
 
@@ -893,8 +937,9 @@ type Kubelet struct {
 	// Handles container probing.
 	probeManager prober.Manager
 	// Manages container health check results.
-	livenessManager proberesults.Manager
-	startupManager  proberesults.Manager
+	livenessManager  proberesults.Manager
+	readinessManager proberesults.Manager
+	startupManager   proberesults.Manager
 
 	// How long to keep idle streaming command execution/port forwarding
 	// connections open before terminating them
@@ -1097,9 +1142,6 @@ type Kubelet struct {
 
 	// trigger deleting containers in a pod
 	containerDeletor *podContainerDeletor
-
-	// trigger deleting sandboxes in a pod
-	sandboxDeleter *podSandboxDeleter
 
 	// config iptables util rules
 	makeIPTablesUtilChains bool
@@ -1410,7 +1452,6 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 
 	// Start component sync loops.
 	kl.statusManager.Start()
-	kl.probeManager.Start()
 
 	// Start syncing RuntimeClasses if enabled.
 	if kl.runtimeClassManager != nil {
@@ -1472,6 +1513,15 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 			return err
 		}
 		return nil
+	}
+
+	// If a pod is still gracefully terminating, then we do not want to
+	// take further action. This mitigates static pods and deleted pods
+	// from getting rerun prematurely or their cgroups being deleted before
+	// the runtime cleans up.
+	podFullName := kubecontainer.GetPodFullName(pod)
+	if kl.podKiller.IsPodPendingTerminationByPodName(podFullName) {
+		return fmt.Errorf("pod %q is pending termination", podFullName)
 	}
 
 	// Latency measurements for the main workflow are relative to the
@@ -1609,7 +1659,6 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 
 	// Create Mirror Pod for Static Pod if it doesn't already exist
 	if kubetypes.IsStaticPod(pod) {
-		podFullName := kubecontainer.GetPodFullName(pod)
 		deleted := false
 		if mirrorPod != nil {
 			if mirrorPod.DeletionTimestamp != nil || !kl.podManager.IsMirrorPodOf(mirrorPod, pod) {
@@ -1739,7 +1788,6 @@ func (kl *Kubelet) deletePod(pod *v1.Pod) error {
 		return fmt.Errorf("pod not found")
 	}
 	podPair := kubecontainer.PodPair{APIPod: pod, RunningPod: &runningPod}
-
 	kl.podKiller.KillPod(&podPair)
 
 	// We leave the volume/directory cleanup to the periodic cleanup routine.
@@ -1867,8 +1915,8 @@ func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHand
 // * plegCh: update the runtime cache; sync pod
 // * syncCh: sync all pods waiting for sync
 // * housekeepingCh: trigger cleanup of pods
-// * liveness manager: sync pods that have failed or in which one or more
-//                     containers have failed liveness checks
+// * health manager: sync pods that have failed or in which one or more
+//                     containers have failed health checks
 func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
 	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
 	select {
@@ -1882,23 +1930,23 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 
 		switch u.Op {
 		case kubetypes.ADD:
-			klog.V(2).Infof("SyncLoop (ADD, %q): %q", u.Source, format.Pods(u.Pods))
+			klog.V(2).InfoS("SyncLoop ADD", "source", u.Source, "pods", format.Pods(u.Pods))
 			// After restarting, kubelet will get all existing pods through
 			// ADD as if they are new pods. These pods will then go through the
 			// admission process and *may* be rejected. This can be resolved
 			// once we have checkpointing.
 			handler.HandlePodAdditions(u.Pods)
 		case kubetypes.UPDATE:
-			klog.V(2).Infof("SyncLoop (UPDATE, %q): %q", u.Source, format.PodsWithDeletionTimestamps(u.Pods))
+			klog.V(2).InfoS("SyncLoop UPDATE", "source", u.Source, "pods", format.Pods(u.Pods))
 			handler.HandlePodUpdates(u.Pods)
 		case kubetypes.REMOVE:
-			klog.V(2).Infof("SyncLoop (REMOVE, %q): %q", u.Source, format.Pods(u.Pods))
+			klog.V(2).InfoS("SyncLoop REMOVE", "source", u.Source, "pods", format.Pods(u.Pods))
 			handler.HandlePodRemoves(u.Pods)
 		case kubetypes.RECONCILE:
-			klog.V(4).Infof("SyncLoop (RECONCILE, %q): %q", u.Source, format.Pods(u.Pods))
+			klog.V(4).InfoS("SyncLoop RECONCILE", "source", u.Source, "pods", format.Pods(u.Pods))
 			handler.HandlePodReconcile(u.Pods)
 		case kubetypes.DELETE:
-			klog.V(2).Infof("SyncLoop (DELETE, %q): %q", u.Source, format.Pods(u.Pods))
+			klog.V(2).Infof("SyncLoop DELETE", "source", u.Source, "pods", format.Pods(u.Pods))
 			// DELETE is treated as a UPDATE because of graceful deletion.
 			handler.HandlePodUpdates(u.Pods)
 		case kubetypes.SET:
@@ -1927,9 +1975,6 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 				klog.V(4).Infof("SyncLoop (PLEG): ignore irrelevant event: %#v", e)
 			}
 		}
-		if e.Type == pleg.ContainerRemoved {
-			kl.deletePodSandbox(e.ID)
-		}
 
 		if e.Type == pleg.ContainerDied {
 			if containerID, ok := e.Data.(string); ok {
@@ -1942,23 +1987,20 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 		if len(podsToSync) == 0 {
 			break
 		}
-		klog.V(4).Infof("SyncLoop (SYNC): %d pods; %s", len(podsToSync), format.Pods(podsToSync))
+		klog.V(4).InfoS("SyncLoop (SYNC) pods", "total", len(podsToSync), "pods", format.Pods(podsToSync))
 		handler.HandlePodSyncs(podsToSync)
 	case update := <-kl.livenessManager.Updates():
 		if update.Result == proberesults.Failure {
-			// The liveness manager detected a failure; sync the pod.
-
-			// We should not use the pod from livenessManager, because it is never updated after
-			// initialization.
-			pod, ok := kl.podManager.GetPodByUID(update.PodUID)
-			if !ok {
-				// If the pod no longer exists, ignore the update.
-				klog.V(4).Infof("SyncLoop (container unhealthy): ignore irrelevant update: %#v", update)
-				break
-			}
-			klog.V(1).Infof("SyncLoop (container unhealthy): %q", format.Pod(pod))
-			handler.HandlePodSyncs([]*v1.Pod{pod})
+			handleProbeSync(kl, update, handler, "liveness", "unhealthy")
 		}
+	case update := <-kl.readinessManager.Updates():
+		ready := update.Result == proberesults.Success
+		kl.statusManager.SetContainerReadiness(update.PodUID, update.ContainerID, ready)
+		handleProbeSync(kl, update, handler, "readiness", map[bool]string{true: "ready", false: ""}[ready])
+	case update := <-kl.startupManager.Updates():
+		started := update.Result == proberesults.Success
+		kl.statusManager.SetContainerStartup(update.PodUID, update.ContainerID, started)
+		handleProbeSync(kl, update, handler, "startup", map[bool]string{true: "started", false: "unhealthy"}[started])
 	case <-housekeepingCh:
 		if !kl.sourcesReady.AllReady() {
 			// If the sources aren't ready or volume manager has not yet synced the states,
@@ -1974,6 +2016,22 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 	return true
 }
 
+func handleProbeSync(kl *Kubelet, update proberesults.Update, handler SyncHandler, probe, status string) {
+	probeAndStatus := probe
+	if len(status) > 0 {
+		probeAndStatus = fmt.Sprintf("%s (container %s)", probe, status)
+	}
+	// We should not use the pod from manager, because it is never updated after initialization.
+	pod, ok := kl.podManager.GetPodByUID(update.PodUID)
+	if !ok {
+		// If the pod no longer exists, ignore the update.
+		klog.V(4).Infof("SyncLoop %s: ignore irrelevant update: %#v", probeAndStatus, update)
+		return
+	}
+	klog.V(1).Infof("SyncLoop %s: %q", probeAndStatus, format.Pod(pod))
+	handler.HandlePodSyncs([]*v1.Pod{pod})
+}
+
 // dispatchWork starts the asynchronous sync of the pod in a pod worker.
 // If the pod has completed termination, dispatchWork will perform no action.
 func (kl *Kubelet) dispatchWork(pod *v1.Pod, syncType kubetypes.SyncPodType, mirrorPod *v1.Pod, start time.Time) {
@@ -1986,8 +2044,9 @@ func (kl *Kubelet) dispatchWork(pod *v1.Pod, syncType kubetypes.SyncPodType, mir
 	}
 
 	// optimization: avoid invoking the pod worker if no further changes are possible to the pod definition
-	if podWorkerTerminal {
-		klog.V(4).Infof("Pod %q has completed, ignoring remaining sync work: %s", format.Pod(pod), syncType)
+	// (i.e. the pod has completed and its containers have been terminated)
+	if podWorkerTerminal && containersTerminal {
+		klog.V(4).InfoS("Pod has completed and its containers have been terminated, ignoring remaining sync work", "pod", klog.KObj(pod), "syncType", syncType)
 		return
 	}
 
@@ -2080,9 +2139,6 @@ func (kl *Kubelet) HandlePodRemoves(pods []*v1.Pod) {
 		if kubetypes.IsMirrorPod(pod) {
 			kl.handleMirrorPod(pod, start)
 			continue
-		}
-		if _, ok := kl.podManager.GetMirrorPodByPod(pod); ok {
-			kl.podKiller.MarkMirrorPodPendingTermination(pod)
 		}
 		// Deletion is allowed to fail because the periodic cleanup routine
 		// will trigger deletion again.
@@ -2194,13 +2250,14 @@ func (kl *Kubelet) ResyncInterval() time.Duration {
 }
 
 // ListenAndServe runs the kubelet HTTP server.
-func (kl *Kubelet) ListenAndServe(address net.IP, port uint, tlsOptions *server.TLSOptions, auth server.AuthInterface, enableCAdvisorJSONEndpoints, enableDebuggingHandlers, enableContentionProfiling, enableSystemLogHandler bool) {
-	server.ListenAndServeKubeletServer(kl, kl.resourceAnalyzer, address, port, tlsOptions, auth, enableCAdvisorJSONEndpoints, enableDebuggingHandlers, enableContentionProfiling, enableSystemLogHandler)
+func (kl *Kubelet) ListenAndServe(kubeCfg *kubeletconfiginternal.KubeletConfiguration, tlsOptions *server.TLSOptions,
+	auth server.AuthInterface) {
+	server.ListenAndServeKubeletServer(kl, kl.resourceAnalyzer, kubeCfg, tlsOptions, auth)
 }
 
 // ListenAndServeReadOnly runs the kubelet HTTP server in read-only mode.
-func (kl *Kubelet) ListenAndServeReadOnly(address net.IP, port uint, enableCAdvisorJSONEndpoints bool) {
-	server.ListenAndServeKubeletReadOnlyServer(kl, kl.resourceAnalyzer, address, port, enableCAdvisorJSONEndpoints)
+func (kl *Kubelet) ListenAndServeReadOnly(address net.IP, port uint) {
+	server.ListenAndServeKubeletReadOnlyServer(kl, kl.resourceAnalyzer, address, port)
 }
 
 // ListenAndServePodResources runs the kubelet podresources grpc service
@@ -2250,16 +2307,6 @@ func (kl *Kubelet) fastStatusUpdateOnce() {
 			kl.syncNodeStatus()
 			return
 		}
-	}
-}
-
-func (kl *Kubelet) deletePodSandbox(podID types.UID) {
-	if podStatus, err := kl.podCache.Get(podID); err == nil {
-		toKeep := 1
-		if kl.IsPodDeleted(podID) {
-			toKeep = 0
-		}
-		kl.sandboxDeleter.deleteSandboxesInPod(podStatus, toKeep)
 	}
 }
 

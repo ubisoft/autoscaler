@@ -25,10 +25,8 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	kubetypes "k8s.io/apimachinery/pkg/types"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util"
@@ -166,11 +164,9 @@ func (m *kubeGenericRuntimeManager) generatePodSandboxLinuxConfig(pod *v1.Pod) (
 	}
 
 	sysctls := make(map[string]string)
-	if utilfeature.DefaultFeatureGate.Enabled(features.Sysctls) {
-		if pod.Spec.SecurityContext != nil {
-			for _, c := range pod.Spec.SecurityContext.Sysctls {
-				sysctls[c.Name] = c.Value
-			}
+	if pod.Spec.SecurityContext != nil {
+		for _, c := range pod.Spec.SecurityContext.Sysctls {
+			sysctls[c.Name] = c.Value
 		}
 	}
 
@@ -312,16 +308,4 @@ func (m *kubeGenericRuntimeManager) GetPortForward(podName, podNamespace string,
 		return nil, err
 	}
 	return url.Parse(resp.Url)
-}
-
-// DeleteSandbox removes the sandbox by sandboxID.
-func (m *kubeGenericRuntimeManager) DeleteSandbox(sandboxID string) error {
-	klog.V(4).Infof("Removing sandbox %q", sandboxID)
-	// stop sandbox is called as part of kill pod function but the error is ignored. So,
-	// we have to call stop sandbox again to make sure that all the resources like network
-	// are cleaned by runtime.
-	if err := m.runtimeService.StopPodSandbox(sandboxID); err != nil {
-		return err
-	}
-	return m.runtimeService.RemovePodSandbox(sandboxID)
 }

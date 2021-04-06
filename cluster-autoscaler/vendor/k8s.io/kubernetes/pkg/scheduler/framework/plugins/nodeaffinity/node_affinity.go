@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -43,8 +44,14 @@ const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
 	Name = "NodeAffinity"
 
+	// preScoreStateKey is the key in CycleState to NodeAffinity pre-computed data for Scoring.
+	preScoreStateKey = "PreScore" + Name
+
+	// preFilterStateKey is the key in CycleState to NodeAffinity pre-compute data for Filtering.
+	preFilterStateKey = "PreFilter" + Name
+
 	// ErrReasonPod is the reason for Pod's node affinity/selector not matching.
-	ErrReasonPod = "node(s) didn't match Pod's node affinity"
+	ErrReasonPod = "node(s) didn't match Pod's node affinity/selector"
 
 	// errReasonEnforced is the reason for added node affinity not matching.
 	errReasonEnforced = "node(s) didn't match scheduler-enforced node affinity"
@@ -53,6 +60,28 @@ const (
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeAffinity) Name() string {
 	return Name
+}
+
+type preFilterState struct {
+	requiredNodeSelector labels.Selector
+	requiredNodeAffinity *nodeaffinity.LazyErrorNodeSelector
+}
+
+// Clone just returns the same state because it is not affected by pod additions or deletions.
+func (s *preFilterState) Clone() framework.StateData {
+	return s
+}
+
+// PreFilter builds and writes cycle state used by Filter.
+func (pl *NodeAffinity) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) *framework.Status {
+	state := getPodRequiredNodeSelectorAndAffinity(pod)
+	cycleState.Write(preFilterStateKey, state)
+	return nil
+}
+
+// PreFilterExtensions not necessary for this plugin as state doesn't depend on pod additions or deletions.
+func (pl *NodeAffinity) PreFilterExtensions() framework.PreFilterExtensions {
+	return nil
 }
 
 // Filter checks if the Node matches the Pod .spec.affinity.nodeAffinity and
@@ -65,9 +94,53 @@ func (pl *NodeAffinity) Filter(ctx context.Context, state *framework.CycleState,
 	if pl.addedNodeSelector != nil && !pl.addedNodeSelector.Match(node) {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, errReasonEnforced)
 	}
-	if !pluginhelper.PodMatchesNodeSelectorAndAffinityTerms(pod, node) {
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonPod)
+
+	s, err := getPreFilterState(state)
+	if err != nil {
+		// Fallback to calculate requiredNodeSelector and requiredNodeAffinity
+		// here when PreFilter is disabled.
+		s = getPodRequiredNodeSelectorAndAffinity(pod)
 	}
+
+	if s.requiredNodeSelector != nil {
+		if !s.requiredNodeSelector.Matches(labels.Set(node.Labels)) {
+			return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonPod)
+		}
+	}
+	if s.requiredNodeAffinity != nil {
+		// Ignore parsing errors for backwards compatibility.
+		matches, _ := s.requiredNodeAffinity.Match(node)
+		if !matches {
+			return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonPod)
+		}
+	}
+	return nil
+}
+
+// preScoreState computed at PreScore and used at Score.
+type preScoreState struct {
+	preferredNodeAffinity *nodeaffinity.PreferredSchedulingTerms
+}
+
+// Clone implements the mandatory Clone interface. We don't really copy the data since
+// there is no need for that.
+func (s *preScoreState) Clone() framework.StateData {
+	return s
+}
+
+// PreScore builds and writes cycle state used by Score and NormalizeScore.
+func (pl *NodeAffinity) PreScore(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+	if len(nodes) == 0 {
+		return nil
+	}
+	preferredNodeAffinity, err := getPodPreferredNodeAffinity(pod)
+	if err != nil {
+		return framework.AsStatus(err)
+	}
+	state := &preScoreState{
+		preferredNodeAffinity: preferredNodeAffinity,
+	}
+	cycleState.Write(preScoreStateKey, state)
 	return nil
 }
 
@@ -85,22 +158,25 @@ func (pl *NodeAffinity) Score(ctx context.Context, state *framework.CycleState, 
 		return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
 	}
 
-	affinity := pod.Spec.Affinity
-
 	var count int64
 	if pl.addedPrefSchedTerms != nil {
 		count += pl.addedPrefSchedTerms.Score(node)
 	}
-	// A nil element of PreferredDuringSchedulingIgnoredDuringExecution matches no objects.
-	// An element of PreferredDuringSchedulingIgnoredDuringExecution that refers to an
-	// empty PreferredSchedulingTerm matches all objects.
-	if affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution != nil {
-		// TODO(#96164): Do this in PreScore to avoid computing it for all nodes.
-		preferredNodeAffinity, err := nodeaffinity.NewPreferredSchedulingTerms(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+
+	s, err := getPreScoreState(state)
+	if err != nil {
+		// Fallback to calculate preferredNodeAffinity here when PreScore is disabled.
+		preferredNodeAffinity, err := getPodPreferredNodeAffinity(pod)
 		if err != nil {
 			return 0, framework.AsStatus(err)
 		}
-		count += preferredNodeAffinity.Score(node)
+		s = &preScoreState{
+			preferredNodeAffinity: preferredNodeAffinity,
+		}
+	}
+
+	if s.preferredNodeAffinity != nil {
+		count += s.preferredNodeAffinity.Score(node)
 	}
 
 	return count, nil
@@ -149,4 +225,53 @@ func getArgs(obj runtime.Object) (config.NodeAffinityArgs, error) {
 		return config.NodeAffinityArgs{}, fmt.Errorf("args are not of type NodeAffinityArgs, got %T", obj)
 	}
 	return *ptr, validation.ValidateNodeAffinityArgs(ptr)
+}
+
+func getPodPreferredNodeAffinity(pod *v1.Pod) (*nodeaffinity.PreferredSchedulingTerms, error) {
+	affinity := pod.Spec.Affinity
+	if affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution != nil {
+		return nodeaffinity.NewPreferredSchedulingTerms(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+	}
+	return nil, nil
+}
+
+func getPreScoreState(cycleState *framework.CycleState) (*preScoreState, error) {
+	c, err := cycleState.Read(preScoreStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q from cycleState: %w", preScoreStateKey, err)
+	}
+
+	s, ok := c.(*preScoreState)
+	if !ok {
+		return nil, fmt.Errorf("invalid PreScore state, got type %T", c)
+	}
+	return s, nil
+}
+
+func getPodRequiredNodeSelectorAndAffinity(pod *v1.Pod) *preFilterState {
+	var selector labels.Selector
+	if len(pod.Spec.NodeSelector) > 0 {
+		selector = labels.SelectorFromSet(pod.Spec.NodeSelector)
+	}
+	// Use LazyErrorNodeSelector for backwards compatibility of parsing errors.
+	var affinity *nodeaffinity.LazyErrorNodeSelector
+	if pod.Spec.Affinity != nil &&
+		pod.Spec.Affinity.NodeAffinity != nil &&
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		affinity = nodeaffinity.NewLazyErrorNodeSelector(pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
+	}
+	return &preFilterState{requiredNodeSelector: selector, requiredNodeAffinity: affinity}
+}
+
+func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error) {
+	c, err := cycleState.Read(preFilterStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q from cycleState: %v", preFilterStateKey, err)
+	}
+
+	s, ok := c.(*preFilterState)
+	if !ok {
+		return nil, fmt.Errorf("invalid PreFilter state, got type %T", c)
+	}
+	return s, nil
 }

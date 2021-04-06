@@ -158,24 +158,24 @@ func (pl *PodTopologySpread) PreFilterExtensions() framework.PreFilterExtensions
 }
 
 // AddPod from pre-computed data in cycleState.
-func (pl *PodTopologySpread) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (pl *PodTopologySpread) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToAdd *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	s, err := getPreFilterState(cycleState)
 	if err != nil {
 		return framework.AsStatus(err)
 	}
 
-	s.updateWithPod(podToAdd, podToSchedule, nodeInfo.Node(), 1)
+	s.updateWithPod(podInfoToAdd.Pod, podToSchedule, nodeInfo.Node(), 1)
 	return nil
 }
 
 // RemovePod from pre-computed data in cycleState.
-func (pl *PodTopologySpread) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToRemove *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (pl *PodTopologySpread) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToRemove *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	s, err := getPreFilterState(cycleState)
 	if err != nil {
 		return framework.AsStatus(err)
 	}
 
-	s.updateWithPod(podToRemove, podToSchedule, nodeInfo.Node(), -1)
+	s.updateWithPod(podInfoToRemove.Pod, podToSchedule, nodeInfo.Node(), -1)
 	return nil
 }
 
@@ -184,7 +184,7 @@ func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error
 	c, err := cycleState.Read(preFilterStateKey)
 	if err != nil {
 		// preFilterState doesn't exist, likely PreFilter wasn't invoked.
-		return nil, fmt.Errorf("reading %q from cycleState: %v", preFilterStateKey, err)
+		return nil, fmt.Errorf("reading %q from cycleState: %w", preFilterStateKey, err)
 	}
 
 	s, ok := c.(*preFilterState)
@@ -198,7 +198,7 @@ func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error
 func (pl *PodTopologySpread) calPreFilterState(pod *v1.Pod) (*preFilterState, error) {
 	allNodes, err := pl.sharedLister.NodeInfos().List()
 	if err != nil {
-		return nil, fmt.Errorf("listing NodeInfos: %v", err)
+		return nil, fmt.Errorf("listing NodeInfos: %w", err)
 	}
 	var constraints []topologySpreadConstraint
 	if len(pod.Spec.TopologySpreadConstraints) > 0 {
@@ -206,12 +206,12 @@ func (pl *PodTopologySpread) calPreFilterState(pod *v1.Pod) (*preFilterState, er
 		// so don't need to re-check feature gate, just check length of Constraints.
 		constraints, err = filterTopologySpreadConstraints(pod.Spec.TopologySpreadConstraints, v1.DoNotSchedule)
 		if err != nil {
-			return nil, fmt.Errorf("obtaining pod's hard topology spread constraints: %v", err)
+			return nil, fmt.Errorf("obtaining pod's hard topology spread constraints: %w", err)
 		}
 	} else {
 		constraints, err = pl.buildDefaultConstraints(pod, v1.DoNotSchedule)
 		if err != nil {
-			return nil, fmt.Errorf("setting default hard topology spread constraints: %v", err)
+			return nil, fmt.Errorf("setting default hard topology spread constraints: %w", err)
 		}
 	}
 	if len(constraints) == 0 {
