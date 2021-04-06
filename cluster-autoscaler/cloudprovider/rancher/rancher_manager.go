@@ -20,6 +20,7 @@ type service interface {
 	NodeByProviderID(providerID string) (*rancher.Node, error)
 	NodeByNameAndCluster(name, cluster string) (*rancher.Node, error)
 	ClusterByID(id string) (*rancher.Cluster, error)
+	ScaleDownNode(nodeID string) error
 }
 
 var (

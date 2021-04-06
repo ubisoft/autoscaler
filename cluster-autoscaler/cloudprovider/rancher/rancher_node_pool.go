@@ -83,9 +83,15 @@ func (n *NodePool) DeleteNodes(nodes []*apiv1.Node) error {
 		if rn.NodePoolID != n.id {
 			return fmt.Errorf("node: %s doesn't belong to the nodePool: %s", node.Name, n.id)
 		}
+
+		if err := n.manager.client.ScaleDownNode(rn.ID); err != nil {
+			return err
+		}
+
+		n.rancherNP.Quantity--
 	}
 
-	return n.DecreaseTargetSize(len(nodes))
+	return nil
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function

@@ -194,6 +194,7 @@ type clientMock struct {
 	nodeByProviderIDFn     func(providerID string) (*rancher.Node, error)
 	deleteNodeFn           func(id string) error
 	nodeByNameAndClusterFn func(name, cluster string) (*rancher.Node, error)
+	ScaleDownNodeFn        func(nodeID string) error
 }
 
 func (s *clientMock) ResizeNodePool(id string, size int) (*rancher.NodePool, error) {
@@ -226,4 +227,8 @@ func (s clientMock) NodeByNameAndCluster(name, cluster string) (*rancher.Node, e
 
 func (s clientMock) ClusterByID(id string) (*rancher.Cluster, error) {
 	return s.clusterByIDFn(id)
+}
+
+func (s clientMock) ScaleDownNode(nodeID string) error {
+	return s.ScaleDownNodeFn(nodeID)
 }

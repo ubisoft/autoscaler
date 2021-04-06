@@ -120,6 +120,13 @@ func (c *Client) NodePoolsByCluster(clusterID string) ([]NodePool, error) {
 	return body.Data, nil
 }
 
+// ScaleDownNode deletes the specific node and  scale down the node pool.
+func (c *Client) ScaleDownNode(nodeID string) error {
+	url := fmt.Sprintf("%s/nodes/%s?action=scaledown", c.url, nodeID)
+	_, err := c.doRequest(http.MethodPost, url, nil, nil)
+	return err
+}
+
 // NodePoolByID returns a node pool by id.
 func (c *Client) NodePoolByID(id string) (*NodePool, error) {
 	url := fmt.Sprintf("%s/nodePools/%s", c.url, id)
