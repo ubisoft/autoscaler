@@ -3,6 +3,7 @@ package rancher
 import (
 	"errors"
 	"fmt"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"math"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -193,4 +194,11 @@ func (n *NodePool) Delete() error {
 // was created by CA and can be deleted when scaled to 0.
 func (n *NodePool) Autoprovisioned() bool {
 	return false
+}
+
+// GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
+// NodeGroup. Returning a nil will result in using default options.
+// Implementation optional.
+func (n *NodePool) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
+	return nil, cloudprovider.ErrNotImplemented
 }
