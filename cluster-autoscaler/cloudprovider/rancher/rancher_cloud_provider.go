@@ -73,6 +73,10 @@ func newRancherProvider(manager *manager, do cloudprovider.NodeGroupDiscoveryOpt
 			return nil, fmt.Errorf("nodePool: %s does not exist", ns.Name)
 		}
 
+		if !np.DrainBeforeDelete {
+			return nil, fmt.Errorf("nodePool: %s must have DrainBeforeDelete enabled", ns.Name)
+		}
+
 		nps[i] = &NodePool{
 			manager:   manager,
 			id:        ns.Name,

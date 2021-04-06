@@ -33,14 +33,15 @@ type Cluster struct {
 
 // NodePool represents a Rancher nodePool.
 type NodePool struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	ClusterID    string `json:"clusterId"`
-	ControlPlane bool   `json:"controlPlane"`
-	Etcd         bool   `json:"etcd"`
-	Worker       bool   `json:"worker"`
-	Quantity     int    `json:"quantity"`
-	State        string `json:"state"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	ClusterID         string `json:"clusterId"`
+	ControlPlane      bool   `json:"controlPlane"`
+	Etcd              bool   `json:"etcd"`
+	Worker            bool   `json:"worker"`
+	Quantity          int    `json:"quantity"`
+	State             string `json:"state"`
+	DrainBeforeDelete bool   `json:"drainBeforeDelete"`
 }
 
 type nodePoolResponse struct {
