@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/rancher/rancher"
 )
 
@@ -134,39 +133,6 @@ func TestManager_getNodePools(t *testing.T) {
 }
 
 func TestManager_getNode(t *testing.T) {
-	t.Run("get node by name - success", func(t *testing.T) {
-		var cli clientMock
-		cli.nodeByNameAndClusterFn = func(name, cluster string) (*rancher.Node, error) {
-			if name == "worker1" {
-				return &rancher.Node{Name: name}, nil
-			}
-			return nil, fmt.Errorf("node %q does not exist", name)
-		}
-
-		manager := manager{client: &cli}
-		node, err := manager.getNode(&apiv1.Node{ObjectMeta: v1.ObjectMeta{Name: "worker1"}})
-		if err != nil {
-			t.Errorf("unexpected error, got %v", err)
-		}
-
-		if node == nil {
-			t.Errorf("expected a node, got %v", node)
-		}
-	})
-
-	t.Run("get node by name - failed ", func(t *testing.T) {
-		var cli clientMock
-		cli.nodeByNameAndClusterFn = func(name, cluster string) (*rancher.Node, error) {
-			return nil, fmt.Errorf("node %q does not exist", name)
-		}
-
-		manager := manager{client: &cli}
-		_, err := manager.getNode(&apiv1.Node{ObjectMeta: v1.ObjectMeta{Name: "worker1"}})
-		if err == nil {
-			t.Error("expected error")
-		}
-	})
-
 	t.Run("get node by providerID - success", func(t *testing.T) {
 		var cli clientMock
 		cli.nodeByProviderIDFn = func(providerID string) (*rancher.Node, error) {

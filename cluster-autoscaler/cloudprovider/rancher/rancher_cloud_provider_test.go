@@ -29,7 +29,7 @@ func TestRancherProvider_NodeGroupForNode(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		var cli clientMock
 		nodePool := NodePool{id: "pool1"}
-		cli.nodeByNameAndClusterFn = func(name, cluster string) (*rancher.Node, error) {
+		cli.nodeByProviderIDFn = func(providerID string) (*rancher.Node, error) {
 			return &rancher.Node{Name: "worker1", NodePoolID: nodePool.id}, nil
 		}
 
@@ -47,8 +47,8 @@ func TestRancherProvider_NodeGroupForNode(t *testing.T) {
 
 	t.Run("node does not exist - failed", func(t *testing.T) {
 		var cli clientMock
-		cli.nodeByNameAndClusterFn = func(name, cluster string) (*rancher.Node, error) {
-			return nil, fmt.Errorf("node %q does not exist", name)
+		cli.nodeByProviderIDFn = func(providerID string) (*rancher.Node, error) {
+			return nil, fmt.Errorf("node %q does not exist", providerID)
 		}
 
 		manager := manager{client: &cli}
@@ -62,7 +62,7 @@ func TestRancherProvider_NodeGroupForNode(t *testing.T) {
 	t.Run("node belongs to nodePool without auto-scale", func(t *testing.T) {
 		var cli clientMock
 		nodePool := NodePool{id: "pool1"}
-		cli.nodeByNameAndClusterFn = func(name, cluster string) (*rancher.Node, error) {
+		cli.nodeByProviderIDFn = func(providerID string) (*rancher.Node, error) {
 			return &rancher.Node{Name: "worker1", NodePoolID: "pool2"}, nil
 		}
 
