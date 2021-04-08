@@ -34,6 +34,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/magnum"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/ovhcloud"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/packet"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/rancher"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 )
 
@@ -87,6 +88,8 @@ func buildCloudProvider(opts config.AutoscalingOptions, do cloudprovider.NodeGro
 		return clusterapi.BuildClusterAPI(opts, do, rl)
 	case cloudprovider.IonoscloudProviderName:
 		return ionoscloud.BuildIonosCloud(opts, do, rl)
+	case cloudprovider.RancherProviderName:
+		return rancher.BuildRancher(opts, do, rl)
 	}
 	return nil
 }
