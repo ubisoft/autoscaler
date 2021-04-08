@@ -30,7 +30,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 
 	"github.com/ghodss/yaml"
 	klog "k8s.io/klog/v2"
@@ -63,7 +63,7 @@ func (t *GceTemplateBuilder) BuildCapacity(cpu int64, mem int64, accelerators []
 	}
 
 	capacity[apiv1.ResourceCPU] = *resource.NewQuantity(cpu, resource.DecimalSI)
-	memTotal := mem - CalculateKernelReserved(mem, os)
+	memTotal := mem - CalculateKernelReserved(mem, os, osDistribution)
 	capacity[apiv1.ResourceMemory] = *resource.NewQuantity(memTotal, resource.DecimalSI)
 
 	if accelerators != nil && len(accelerators) > 0 {
@@ -165,10 +165,13 @@ func (t *GceTemplateBuilder) BuildNodeFromTemplate(mig Mig, template *gce.Instan
 		return nil, fmt.Errorf("could not obtain os-distribution from kube-env from template metadata")
 	}
 
-	ephemeralStorage, err := getEphemeralStorageFromInstanceTemplateProperties(template.Properties)
-	if err != nil {
-		klog.Errorf("could not fetch ephemeral storage from instance template. %s", err)
-		return nil, err
+	var ephemeralStorage int64 = -1
+	if !isEphemeralStorageWithInstanceTemplateDisabled(kubeEnvValue) {
+		ephemeralStorage, err = getEphemeralStorageFromInstanceTemplateProperties(template.Properties)
+		if err != nil {
+			klog.Errorf("could not fetch ephemeral storage from instance template. %s", err)
+			return nil, err
+		}
 	}
 
 	capacity, err := t.BuildCapacity(cpu, mem, template.Properties.GuestAccelerators, os, osDistribution, ephemeralStorage, pods)
@@ -223,6 +226,17 @@ func (t *GceTemplateBuilder) BuildNodeFromTemplate(mig Mig, template *gce.Instan
 	// Ready status
 	node.Status.Conditions = cloudprovider.BuildReadyConditions()
 	return &node, nil
+}
+
+// isEphemeralStorageWithInstanceTemplateDisabled will allow bypassing Disk Size of Boot Disk from being
+// picked up from Instance Template and used as Ephemeral Storage, in case other type of storage are used
+// as ephemeral storage
+func isEphemeralStorageWithInstanceTemplateDisabled(kubeEnvValue string) bool {
+	v, found, err := extractAutoscalerVarFromKubeEnv(kubeEnvValue, "BLOCK_EPH_STORAGE_BOOT_DISK")
+	if err == nil && found && v == "true" {
+		return true
+	}
+	return false
 }
 
 func getEphemeralStorageFromInstanceTemplateProperties(instanceProperties *gce.InstanceProperties) (ephemeralStorage int64, err error) {
@@ -404,6 +418,10 @@ const (
 	OperatingSystemDistributionWindowsSAC OperatingSystemDistribution = "windows_sac"
 	// OperatingSystemDistributionCOS is used if operating distribution system is COS
 	OperatingSystemDistributionCOS OperatingSystemDistribution = "cos"
+	// OperatingSystemDistributionCOSContainerd is used if operating distribution system is COS Containerd
+	OperatingSystemDistributionCOSContainerd OperatingSystemDistribution = "cos_containerd"
+	// OperatingSystemDistributionUbuntuContainerd is used if operating distribution system is Ubuntu Containerd
+	OperatingSystemDistributionUbuntuContainerd OperatingSystemDistribution = "ubuntu_containerd"
 
 	// OperatingSystemDistributionDefault defines which operating system will be assumed if not explicitly passed via AUTOSCALER_ENV_VARS
 	OperatingSystemDistributionDefault = OperatingSystemDistributionCOS
@@ -431,6 +449,10 @@ func extractOperatingSystemDistributionFromKubeEnv(kubeEnv string) OperatingSyst
 		return OperatingSystemDistributionWindowsSAC
 	case string(OperatingSystemDistributionCOS):
 		return OperatingSystemDistributionCOS
+	case string(OperatingSystemDistributionCOSContainerd):
+		return OperatingSystemDistributionCOSContainerd
+	case string(OperatingSystemDistributionUbuntuContainerd):
+		return OperatingSystemDistributionUbuntuContainerd
 	default:
 		klog.Errorf("unexpected os-distribution=%v passed via AUTOSCALER_ENV_VARS", osDistributionValue)
 		return OperatingSystemDistributionUnknown

@@ -18,6 +18,7 @@ package gce
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -29,7 +30,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	quota "k8s.io/apiserver/pkg/quota/v1"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -37,17 +38,20 @@ import (
 func TestBuildNodeFromTemplateSetsResources(t *testing.T) {
 	var thirtyPodsPerNode int64 = 30
 	type testCase struct {
-		scenario       string
-		kubeEnv        string
-		accelerators   []*gce.AcceleratorConfig
-		mig            Mig
-		physicalCpu    int64
-		physicalMemory int64
-		kubeReserved   bool
-		reservedCpu    string
-		reservedMemory string
-		expectedErr    bool
-		pods           *int64
+		scenario                  string
+		kubeEnv                   string
+		accelerators              []*gce.AcceleratorConfig
+		mig                       Mig
+		physicalCpu               int64
+		physicalMemory            int64
+		physicalEphemeralStorage  int64
+		kubeReserved              bool
+		reservedCpu               string
+		reservedMemory            string
+		reservedEphemeralStorage  string
+		isEphemeralStorageBlocked bool
+		expectedErr               bool
+		pods                      *int64
 	}
 	testCases := []testCase{
 		{
@@ -55,18 +59,20 @@ func TestBuildNodeFromTemplateSetsResources(t *testing.T) {
 			kubeEnv: "ENABLE_NODE_PROBLEM_DETECTOR: 'daemonset'\n" +
 				"NODE_LABELS: a=b,c=d,cloud.google.com/gke-nodepool=pool-3,cloud.google.com/gke-preemptible=true\n" +
 				"DNS_SERVER_IP: '10.0.0.10'\n" +
-				fmt.Sprintf("KUBELET_TEST_ARGS: --experimental-allocatable-ignore-eviction --kube-reserved=cpu=1000m,memory=%v\n", 1*units.MiB) +
+				fmt.Sprintf("KUBELET_TEST_ARGS: --experimental-allocatable-ignore-eviction --kube-reserved=cpu=1000m,memory=%v,ephemeral-storage=30Gi\n", 1*units.MiB) +
 				"NODE_TAINTS: 'dedicated=ml:NoSchedule,test=dev:PreferNoSchedule,a=b:c'\n",
 			accelerators: []*gce.AcceleratorConfig{
 				{AcceleratorType: "nvidia-tesla-k80", AcceleratorCount: 3},
 				{AcceleratorType: "nvidia-tesla-p100", AcceleratorCount: 8},
 			},
-			physicalCpu:    8,
-			physicalMemory: 200 * units.MiB,
-			kubeReserved:   true,
-			reservedCpu:    "1000m",
-			reservedMemory: fmt.Sprintf("%v", 1*units.MiB),
-			expectedErr:    false,
+			physicalCpu:              8,
+			physicalMemory:           200 * units.MiB,
+			physicalEphemeralStorage: 300,
+			kubeReserved:             true,
+			reservedCpu:              "1000m",
+			reservedMemory:           fmt.Sprintf("%v", 1*units.MiB),
+			reservedEphemeralStorage: "30Gi",
+			expectedErr:              false,
 		},
 		{
 			scenario: "no kube-reserved in kube-env",
@@ -98,6 +104,40 @@ func TestBuildNodeFromTemplateSetsResources(t *testing.T) {
 			kubeReserved:   false,
 			expectedErr:    false,
 		},
+		{
+			scenario: "BLOCK_EPH_STORAGE_BOOT_DISK in kube-env",
+			kubeEnv: "ENABLE_NODE_PROBLEM_DETECTOR: 'daemonset'\n" +
+				"NODE_LABELS: a=b,c=d,cloud.google.com/gke-nodepool=pool-3,cloud.google.com/gke-preemptible=true\n" +
+				"DNS_SERVER_IP: '10.0.0.10'\n" +
+				"AUTOSCALER_ENV_VARS: os_distribution=cos;os=linux;kube_reserved=cpu=0,memory=0,ephemeral-storage=0;BLOCK_EPH_STORAGE_BOOT_DISK=true\n" +
+				"NODE_TAINTS: 'dedicated=ml:NoSchedule,test=dev:PreferNoSchedule,a=b:c'\n",
+			physicalCpu:               8,
+			physicalMemory:            200 * units.MiB,
+			physicalEphemeralStorage:  300,
+			reservedCpu:               "0m",
+			reservedMemory:            fmt.Sprintf("%v", 0*units.MiB),
+			reservedEphemeralStorage:  "0Gi",
+			kubeReserved:              true,
+			isEphemeralStorageBlocked: true,
+			expectedErr:               false,
+		},
+		{
+			scenario: "BLOCK_EPH_STORAGE_BOOT_DISK is false in kube-env",
+			kubeEnv: "ENABLE_NODE_PROBLEM_DETECTOR: 'daemonset'\n" +
+				"NODE_LABELS: a=b,c=d,cloud.google.com/gke-nodepool=pool-3,cloud.google.com/gke-preemptible=true\n" +
+				"DNS_SERVER_IP: '10.0.0.10'\n" +
+				"AUTOSCALER_ENV_VARS: os_distribution=cos;os=linux;kube_reserved=cpu=0,memory=0,ephemeral-storage=0;BLOCK_EPH_STORAGE_BOOT_DISK=false\n" +
+				"NODE_TAINTS: 'dedicated=ml:NoSchedule,test=dev:PreferNoSchedule,a=b:c'\n",
+			physicalCpu:               8,
+			physicalMemory:            200 * units.MiB,
+			physicalEphemeralStorage:  300,
+			reservedCpu:               "0m",
+			reservedMemory:            fmt.Sprintf("%v", 0*units.MiB),
+			reservedEphemeralStorage:  "0Gi",
+			kubeReserved:              true,
+			isEphemeralStorageBlocked: false,
+			expectedErr:               false,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.scenario, func(t *testing.T) {
@@ -119,7 +159,7 @@ func TestBuildNodeFromTemplateSetsResources(t *testing.T) {
 						{
 							Boot: true,
 							InitializeParams: &gce.AttachedDiskInitializeParams{
-								DiskSizeGb: 0,
+								DiskSizeGb: tc.physicalEphemeralStorage,
 							},
 						},
 					},
@@ -137,13 +177,17 @@ func TestBuildNodeFromTemplateSetsResources(t *testing.T) {
 				assert.NotNil(t, node.Status)
 				assert.NotNil(t, node.Status.Capacity)
 				assert.NotNil(t, node.Status.Allocatable)
-				capacity, err := tb.BuildCapacity(tc.physicalCpu, tc.physicalMemory, tc.accelerators, OperatingSystemLinux, OperatingSystemDistributionCOS, -1, tc.pods)
+				physicalEphemeralStorage := tc.physicalEphemeralStorage
+				if tc.isEphemeralStorageBlocked {
+					physicalEphemeralStorage = 0
+				}
+				capacity, err := tb.BuildCapacity(tc.physicalCpu, tc.physicalMemory, tc.accelerators, OperatingSystemLinux, OperatingSystemDistributionCOS, physicalEphemeralStorage*units.GiB, tc.pods)
 				assert.NoError(t, err)
 				assertEqualResourceLists(t, "Capacity", capacity, node.Status.Capacity)
 				if !tc.kubeReserved {
 					assertEqualResourceLists(t, "Allocatable", capacity, node.Status.Allocatable)
 				} else {
-					reserved, err := makeResourceList(tc.reservedCpu, tc.reservedMemory, 0, "")
+					reserved, err := makeResourceList(tc.reservedCpu, tc.reservedMemory, 0, tc.reservedEphemeralStorage)
 					assert.NoError(t, err)
 					allocatable := tb.CalculateAllocatable(capacity, reserved, ParseEvictionHardOrGetDefault(nil))
 					assertEqualResourceLists(t, "Allocatable", allocatable, node.Status.Allocatable)
@@ -411,19 +455,19 @@ func TestBuildCapacityMemory(t *testing.T) {
 			physicalCpu:            1,
 			physicalMemory:         2 * units.GiB,
 			os:                     OperatingSystemLinux,
-			expectedCapacityMemory: 2*units.GiB - 32*units.MiB - kernelReservedMemory,
+			expectedCapacityMemory: 2*units.GiB - 32*units.MiB - kernelReservedMemory - int64(math.Min(correctionConstant*float64(2*units.GiB), maximumCorrectionValue)),
 		},
 		{
 			physicalCpu:            2,
 			physicalMemory:         4 * units.GiB,
 			os:                     OperatingSystemLinux,
-			expectedCapacityMemory: 4*units.GiB - 64*units.MiB - kernelReservedMemory - swiotlbReservedMemory,
+			expectedCapacityMemory: 4*units.GiB - 64*units.MiB - kernelReservedMemory - swiotlbReservedMemory - int64(math.Min(correctionConstant*float64(4*units.GiB), maximumCorrectionValue)),
 		},
 		{
 			physicalCpu:            32,
 			physicalMemory:         128 * units.GiB,
 			os:                     OperatingSystemLinux,
-			expectedCapacityMemory: 128*units.GiB - 2*units.GiB - kernelReservedMemory - swiotlbReservedMemory,
+			expectedCapacityMemory: 128*units.GiB - 2*units.GiB - kernelReservedMemory - swiotlbReservedMemory - int64(math.Min(correctionConstant*float64(128*units.GiB), maximumCorrectionValue)),
 		},
 		{
 			physicalCpu:            2,
@@ -798,6 +842,28 @@ func TestExtractOperatingSystemDistributionFromKubeEnv(t *testing.T) {
 				"os_distribution=cos\n" +
 				"KUBELET_TEST_ARGS: --experimental-allocatable-ignore-eviction\n",
 			expectedOperatingSystemDistribution: OperatingSystemDistributionCOS,
+		},
+		{
+			name: "cos containerd",
+			kubeEnv: "ENABLE_NODE_PROBLEM_DETECTOR: 'daemonset'\n" +
+				"DNS_SERVER_IP: '10.0.0.10'\n" +
+				"AUTOSCALER_ENV_VARS: node_labels=a=b,c=d,cloud.google.com/gke-nodepool=pool-3,cloud.google.com/gke-preemptible=true;" +
+				"node_taints='dedicated=ml:NoSchedule,test=dev:PreferNoSchedule,a=b:c';" +
+				"kube_reserved=cpu=1000m,memory=300000Mi;" +
+				"os_distribution=cos_containerd\n" +
+				"KUBELET_TEST_ARGS: --experimental-allocatable-ignore-eviction\n",
+			expectedOperatingSystemDistribution: OperatingSystemDistributionCOSContainerd,
+		},
+		{
+			name: "ubuntu containerd",
+			kubeEnv: "ENABLE_NODE_PROBLEM_DETECTOR: 'daemonset'\n" +
+				"DNS_SERVER_IP: '10.0.0.10'\n" +
+				"AUTOSCALER_ENV_VARS: node_labels=a=b,c=d,cloud.google.com/gke-nodepool=pool-3,cloud.google.com/gke-preemptible=true;" +
+				"node_taints='dedicated=ml:NoSchedule,test=dev:PreferNoSchedule,a=b:c';" +
+				"kube_reserved=cpu=1000m,memory=300000Mi;" +
+				"os_distribution=ubuntu_containerd\n" +
+				"KUBELET_TEST_ARGS: --experimental-allocatable-ignore-eviction\n",
+			expectedOperatingSystemDistribution: OperatingSystemDistributionUbuntuContainerd,
 		},
 		{
 			name: "ubuntu",

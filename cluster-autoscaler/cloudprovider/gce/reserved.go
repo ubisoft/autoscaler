@@ -57,6 +57,15 @@ const (
 	// Reserved memory for software IO TLB
 	swiotlbReservedMemory  = 64 * MiB
 	swiotlbThresholdMemory = 3 * GiB
+
+	// Memory Estimation Correction
+	// correctionConstant is a linear constant for additional reserved memory
+	correctionConstant = 0.00175
+	// maximumCorrectionValue is the max-cap for additional reserved memory
+	maximumCorrectionValue = 248 * MiB
+	// ubuntuSpecificOffset is a constant value that is additionally added to Ubuntu
+	// based distributions as reserved memory
+	ubuntuSpecificOffset = 4 * MiB
 )
 
 // EvictionHard is the struct used to keep parsed values for eviction
@@ -67,7 +76,7 @@ type EvictionHard struct {
 
 // CalculateKernelReserved computes how much memory Linux kernel will reserve.
 // TODO(jkaniuk): account for crashkernel reservation on RHEL / CentOS
-func CalculateKernelReserved(physicalMemory int64, os OperatingSystem) int64 {
+func CalculateKernelReserved(physicalMemory int64, os OperatingSystem, osDistribution OperatingSystemDistribution) int64 {
 	switch os {
 	case OperatingSystemLinux:
 		// Account for memory reserved by kernel
@@ -77,6 +86,18 @@ func CalculateKernelReserved(physicalMemory int64, os OperatingSystem) int64 {
 		if physicalMemory > swiotlbThresholdMemory {
 			reserved += swiotlbReservedMemory
 		}
+
+		// Additional reserved memory to correct estimation
+		// The reason for this value is we detected additional reservation, but we were
+		// unable to find the root cause. Hence, we added a best estimated formula that was
+		// statistically developed.
+		if osDistribution == OperatingSystemDistributionCOS || osDistribution == OperatingSystemDistributionCOSContainerd {
+			reserved += int64(math.Min(correctionConstant*float64(physicalMemory), maximumCorrectionValue))
+		} else if osDistribution == OperatingSystemDistributionUbuntu || osDistribution == OperatingSystemDistributionUbuntuContainerd {
+			reserved += int64(math.Min(correctionConstant*float64(physicalMemory), maximumCorrectionValue))
+			reserved += ubuntuSpecificOffset
+		}
+
 		return reserved
 	case OperatingSystemWindows:
 		return 0
@@ -172,11 +193,11 @@ func parsePercentageToRatio(percentString string) (float64, error) {
 // CalculateOSReservedEphemeralStorage estimates how much ephemeral storage OS will reserve and eviction threshold
 func CalculateOSReservedEphemeralStorage(diskSize int64, osDistribution OperatingSystemDistribution) int64 {
 	switch osDistribution {
-	case OperatingSystemDistributionCOS:
+	case OperatingSystemDistributionCOS, OperatingSystemDistributionCOSContainerd:
 		storage := int64(math.Ceil(0.015635*float64(diskSize))) + int64(math.Ceil(4.148*GiB)) // os partition estimation
 		storage += int64(math.Min(100*MiB, math.Ceil(0.001*float64(diskSize))))               // over-provisioning buffer
 		return storage
-	case OperatingSystemDistributionUbuntu:
+	case OperatingSystemDistributionUbuntu, OperatingSystemDistributionUbuntuContainerd:
 		storage := int64(math.Ceil(0.03083*float64(diskSize))) + int64(math.Ceil(0.171*GiB)) // os partition estimation
 		storage += int64(math.Min(100*MiB, math.Ceil(0.001*float64(diskSize))))              // over-provisioning buffer
 		return storage
