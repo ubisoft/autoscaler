@@ -53,6 +53,8 @@ const (
 	IonoscloudProviderName = "ionoscloud"
 	// RancherProviderName gets the provider name of rancher
 	RancherProviderName = "rancher"
+	// OVHcloudProviderName gets the provider name of ovhcloud
+	OVHcloudProviderName = "ovhcloud"
 )
 
 // CloudProvider contains configuration info and functions for interacting with
